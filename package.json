@@ -1,19 +1,19 @@
 {
   "name": "@bounceprotect/mcp",
-  "version": "1.1.0",
-  "mcpName": "com.bounceprotect.www/mcp",
+  "version": "1.2.0",
+  "mcpName": "io.github.fahasann00/bounceprotect",
   "description": "Email validation and SMTP verification for AI assistants. Validate emails directly inside Claude Desktop, Cursor, and Claude Code.",
   "type": "module",
   "main": "index.js",
   "bin": {
-    "bounceprotect-mcp": "index.js"
+    "bounceprotect-mcp": "./index.js"
   },
   "scripts": {
     "start": "node index.js"
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/bounceprotect/bounceprotect-mcp.git"
+    "url": "https://github.com/fahasann00/email_analyzer.git"
   },
   "keywords": [
     "mcp",
