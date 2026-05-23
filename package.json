@@ -5,9 +5,6 @@
   "description": "Email validation and SMTP verification for AI assistants. Validate emails directly inside Claude Desktop, Cursor, and Claude Code.",
   "type": "module",
   "main": "index.js",
-  "bin": {
-    "bounceprotect-mcp": "index.js"
-  },
   "scripts": {
     "start": "node index.js"
   },
