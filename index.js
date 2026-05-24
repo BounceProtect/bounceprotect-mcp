@@ -95,20 +95,52 @@ async function callBounceProtect(path, options = {}) {
 }
 
 function formatResultLine(row) {
-  const icon =
-    row.status === "invalid"
-      ? "❌"
-      : row.status === "risky"
-        ? "⚠️"
-        : row.status === "unknown"
-          ? "❓"
-          : "✅";
-
-  const email = row.email ?? row.normalized_email ?? row.original_email ?? "unknown";
-  const recommendation = row.send_recommendation ?? "unknown";
-  const score = row.deliverability_score ?? "unknown";
+  const email = row.normalized_email ?? row.email ?? row.original_email ?? "unknown";
+  const status = row.status ?? "unknown";
+  const score = row.deliverability_score ?? row.score ?? "?";
+  const recommendation = formatRecommendation(row.send_recommendation);
   const smtpResult = row.smtp_result ?? "not_checked";
-  return `${icon} ${email} — ${row.status ?? "unknown"} | ${recommendation} | Score: ${score}/100 | SMTP: ${smtpResult}`;
+  const smtpLabels = {
+    accepted: "✓ Passed",
+    rejected: "✗ Rejected — mailbox does not exist",
+    error: "Unverifiable (provider blocks probing)",
+    not_checked: "⏳ Pending",
+  };
+  const smtpDisplay = smtpLabels[smtpResult] ?? smtpResult;
+  const icon =
+    status === "valid" ? "✅" : status === "invalid" ? "❌" : status === "risky" ? "⚠️" : "❓";
+
+  const explanation = row.status_explanation ?? "";
+  const signals = [];
+  if (row.is_role_account) signals.push("role account");
+  if (row.is_catch_all) {
+    signals.push(
+      `catch-all${row.catch_all_confidence ? ` (${row.catch_all_confidence} confidence)` : ""}`,
+    );
+  }
+  if (row.is_disposable) signals.push("disposable");
+  if (row.is_free_email_provider) signals.push("free provider");
+  if (row.is_possible_domain_typo && row.suggested_domain) {
+    signals.push(`possible typo → ${row.suggested_domain}`);
+  }
+
+  const mainLine = `${icon} ${email} — ${status} | ${recommendation} | Score: ${score}/100 | SMTP: ${smtpDisplay}`;
+  const detailLine = explanation
+    ? `   ↳ ${explanation}${signals.length ? ` [${signals.join(", ")}]` : ""}`
+    : signals.length
+      ? `   ↳ ${signals.join(", ")}`
+      : "";
+
+  return detailLine ? `${mainLine}\n${detailLine}` : mainLine;
+}
+
+function formatRecommendation(recommendation) {
+  if (!recommendation) return "unknown";
+  if (recommendation === "SEND") return "SEND";
+  if (recommendation === "SEND_WITH_CAUTION") return "SEND WITH CAUTION";
+  if (recommendation === "REVIEW") return "REVIEW";
+  if (recommendation === "DO_NOT_SEND") return "DO NOT SEND";
+  return recommendation;
 }
 
 function formatBulkSummary(rows) {
@@ -118,6 +150,65 @@ function formatBulkSummary(rows) {
     risky: rows.filter((row) => row.status === "risky").length,
     unknown: rows.filter((row) => row.status === "unknown").length,
   };
+}
+
+async function fetchCompletedSmtpResults(uploadId, apiKey) {
+  const rowsResult = await callBounceProtectUrl(
+    `${SITE_BASE_URL}/api/uploads/${uploadId}/rows?page=0&page_size=500`,
+    {
+      method: "GET",
+      headers: { Authorization: `Bearer ${apiKey}` },
+    },
+  );
+
+  if (!rowsResult.ok) {
+    return textResult(rowsResult.message);
+  }
+
+  const rowsData = rowsResult.data ?? {};
+  const rows = Array.isArray(rowsData.rows) ? rowsData.rows : [];
+  const counts = formatBulkSummary(rows);
+  const formattedRows = rows.map(formatResultLine);
+
+  return textResult(
+    [
+      `SMTP verification complete for upload ${uploadId}.`,
+      "",
+      "Results:",
+      ...formattedRows,
+      "",
+      `Summary: ${counts.valid} valid · ${counts.invalid} invalid · ${counts.risky} risky · ${counts.unknown} unknown`,
+    ].join("\n"),
+  );
+}
+
+async function pollSmtpStatus(uploadId, apiKey, maxWaitMs = 25 * 60 * 1000) {
+  const start = Date.now();
+  while (Date.now() - start < maxWaitMs) {
+    await new Promise((resolve) => setTimeout(resolve, 30000));
+
+    const statusResult = await callBounceProtectUrl(
+      `${SITE_BASE_URL}/api/uploads/${uploadId}/smtp-status`,
+      { method: "GET", headers: { Authorization: `Bearer ${apiKey}` } },
+    );
+
+    if (!statusResult.ok) return textResult(statusResult.message);
+
+    const status = statusResult.data ?? {};
+    const done = status.smtp_done ?? 0;
+    const total = status.total_eligible ?? 0;
+
+    console.error(`[smtp-poll] ${done}/${total} checked...`);
+
+    if (status.is_complete) {
+      return fetchCompletedSmtpResults(uploadId, apiKey);
+    }
+  }
+
+  return textResult(
+    `SMTP verification is taking longer than expected (25+ min). ` +
+    `Use get_smtp_status with upload_id ${uploadId} to check manually.`,
+  );
 }
 
 async function validateEmail(email) {
@@ -158,10 +249,23 @@ async function validateEmail(email) {
   ].filter(Boolean);
 
   if (data.smtp_pending && data.smtp_upload_id) {
-    lines.push("", `smtp_pending: true`, `smtp_upload_id: ${data.smtp_upload_id}`);
-    if (data.smtp_message) {
-      lines.push(data.smtp_message);
-    }
+    const preliminaryOutput = [
+      "⚠️ RESULTS INCOMPLETE — SMTP verification is running in the background.",
+      "The recommendations below are preliminary. Final results follow automatically.",
+      "",
+      "--- PRELIMINARY RESULTS ---",
+      "",
+      ...lines,
+      "",
+      "Waiting for SMTP verification to complete...",
+    ].join("\n");
+
+    const finalResult = await pollSmtpStatus(data.smtp_upload_id, getApiKey());
+    return textResult(
+      preliminaryOutput +
+        "\n\n--- FINAL RESULTS (SMTP complete) ---\n\n" +
+        (finalResult.content?.[0]?.text ?? "SMTP results unavailable."),
+    );
   }
 
   return textResult(lines.join("\n"));
@@ -200,10 +304,26 @@ async function validateEmailsBulk(emails) {
   ];
 
   if (data.smtp_pending && data.smtp_upload_id) {
-    lines.push("", "smtp_pending: true", `smtp_upload_id: ${data.smtp_upload_id}`);
-    if (data.smtp_message) {
-      lines.push(data.smtp_message);
-    }
+    const preliminaryOutput = [
+      "⚠️ RESULTS INCOMPLETE — SMTP verification is running in the background.",
+      "The recommendations below are preliminary. Final results follow automatically.",
+      "",
+      "--- PRELIMINARY RESULTS ---",
+      "",
+      ...formattedRows,
+      "",
+      `Summary (preliminary): ${counts.valid} valid · ${counts.invalid} invalid · ${counts.risky} risky · ${counts.unknown} unknown`,
+      "",
+      "Waiting for SMTP verification to complete...",
+    ].join("\n");
+
+    const finalResult = await pollSmtpStatus(data.smtp_upload_id, getApiKey());
+
+    return textResult(
+      preliminaryOutput +
+        "\n\n--- FINAL RESULTS (SMTP complete) ---\n\n" +
+        (finalResult.content?.[0]?.text ?? "SMTP results unavailable."),
+    );
   }
 
   return textResult(lines.join("\n"));
@@ -223,8 +343,10 @@ async function checkCredits() {
 }
 
 async function getSmtpStatus(uploadId) {
+  const apiKey = process.env.BOUNCEPROTECT_API_KEY;
   const statusResult = await callBounceProtectUrl(`${SITE_BASE_URL}/api/uploads/${uploadId}/smtp-status`, {
     method: "GET",
+    headers: { Authorization: `Bearer ${apiKey}` },
   });
 
   if (!statusResult.ok) {
@@ -236,42 +358,72 @@ async function getSmtpStatus(uploadId) {
   const total = status.total_eligible ?? 0;
 
   if (!status.is_complete) {
-    return textResult(`SMTP verification still running: ${done} of ${total} checked. Try again in 30 seconds.`);
+    return pollSmtpStatus(uploadId, apiKey);
   }
 
-  const rowsResult = await callBounceProtectUrl(
-    `${SITE_BASE_URL}/api/uploads/${uploadId}/rows?page=0&page_size=500`,
-    { method: "GET" },
-  );
+  return fetchCompletedSmtpResults(uploadId, apiKey);
+}
 
-  if (!rowsResult.ok) {
-    return textResult(rowsResult.message);
+function formatDeepAnalysisResults(data) {
+  const domainResults = Array.isArray(data.domain_results) ? data.domain_results : [];
+  const lines = [`Deep analysis complete. ${domainResults.length} domains analysed.`, ""];
+
+  for (const row of domainResults) {
+    lines.push(
+      `🏢 ${row.domain ?? "unknown"} — Score: ${row.business_legitimacy_score ?? "?"}/100 | Website: ${row.has_website ?? false} | SSL: ${row.has_ssl ?? false} | Parked: ${row.is_parked ?? false}`,
+    );
+    if (row.org_matched) {
+      lines.push(
+        `   Org: ${row.org_name ?? "Unknown"} | ${row.org_industry ?? "?"} | ${row.org_employee_size ?? "?"} employees | ${row.org_country ?? "?"} | ${row.org_linkedin_url ?? "No LinkedIn"}`,
+      );
+    }
   }
 
-  const rowsData = rowsResult.data ?? {};
-  const rows = Array.isArray(rowsData.rows) ? rowsData.rows : [];
-  const counts = formatBulkSummary(rows);
-  const formattedRows = rows.map(formatResultLine);
+  return textResult(lines.join("\n"));
+}
+
+async function pollDeepAnalysis(uploadId, apiKey, maxWaitMs = 10 * 60 * 1000) {
+  const start = Date.now();
+  while (Date.now() - start < maxWaitMs) {
+    await new Promise((resolve) => setTimeout(resolve, 20000));
+
+    const result = await callBounceProtectUrl(
+      `${SITE_BASE_URL}/api/uploads/${uploadId}/deep-analysis`,
+      { method: "GET", headers: { Authorization: `Bearer ${apiKey}` } },
+    );
+
+    if (!result.ok) return textResult(result.message);
+
+    const job = result.data?.job ?? null;
+    if (!job) return textResult("Deep analysis job not found.");
+
+    if (job.status === "completed") {
+      return formatDeepAnalysisResults(result.data);
+    }
+    if (job.status === "failed" || job.status === "stopped") {
+      return textResult(`Deep analysis ${job.status}. Try trigger_deep_analysis again.`);
+    }
+
+    if (!job.domains_total) {
+      console.error("Deep analysis is initialising — domain scan starting...");
+    } else {
+      console.error(
+        `[deep-analysis] ${job.domains_checked ?? 0}/${job.domains_total ?? "?"} domains checked, waiting...`,
+      );
+    }
+  }
 
   return textResult(
-    [
-      `SMTP verification complete for upload ${uploadId}.`,
-      "",
-      "Results:",
-      ...formattedRows,
-      "",
-      "Summary:",
-      `- Valid: ${counts.valid}`,
-      `- Invalid: ${counts.invalid}`,
-      `- Risky: ${counts.risky}`,
-      `- Unknown: ${counts.unknown}`,
-    ].join("\n"),
+    `Deep analysis is taking longer than expected (10+ minutes). ` +
+    `Use get_deep_analysis_status with upload_id ${uploadId} to check when it completes.`,
   );
 }
 
 async function triggerDeepAnalysis(uploadId) {
+  const apiKey = process.env.BOUNCEPROTECT_API_KEY;
   const result = await callBounceProtectUrl(`${SITE_BASE_URL}/api/uploads/${uploadId}/deep-analysis`, {
     method: "POST",
+    headers: { Authorization: `Bearer ${apiKey}` },
   });
 
   if (!result.ok) {
@@ -281,19 +433,34 @@ async function triggerDeepAnalysis(uploadId) {
   const data = result.data ?? {};
 
   if (data.already_exists) {
-    return textResult(
-      `Deep analysis already running or completed for this upload (job_id: ${data.job_id ?? "unknown"}, status: ${data.status ?? "unknown"}). Use get_deep_analysis_status to check progress.`,
-    );
+    if (data.status === "completed") {
+      const completedResult = await callBounceProtectUrl(`${SITE_BASE_URL}/api/uploads/${uploadId}/deep-analysis`, {
+        method: "GET",
+        headers: { Authorization: `Bearer ${apiKey}` },
+      });
+
+      if (!completedResult.ok) {
+        return textResult(completedResult.message);
+      }
+
+      return formatDeepAnalysisResults(completedResult.data ?? {});
+    }
+  } else {
+    console.error("Deep analysis started — monitoring progress (checks every 20s, up to 10 min)...");
   }
 
-  return textResult(
-    `Deep analysis started for upload ${uploadId}. Job ID: ${data.job_id ?? "unknown"}. Use get_deep_analysis_status to poll for results — typically completes in 2-5 minutes.`,
-  );
+  if (data.already_exists && (data.status === "pending" || data.status === "running")) {
+    console.error("Deep analysis started — monitoring progress (checks every 20s, up to 10 min)...");
+  }
+
+  return pollDeepAnalysis(uploadId, apiKey);
 }
 
 async function getDeepAnalysisStatus(uploadId) {
+  const apiKey = process.env.BOUNCEPROTECT_API_KEY;
   const result = await callBounceProtectUrl(`${SITE_BASE_URL}/api/uploads/${uploadId}/deep-analysis`, {
     method: "GET",
+    headers: { Authorization: `Bearer ${apiKey}` },
   });
 
   if (!result.ok) {
@@ -308,6 +475,9 @@ async function getDeepAnalysisStatus(uploadId) {
   }
 
   if (job.status === "pending" || job.status === "running") {
+    if (!job.domains_total) {
+      return textResult("Deep analysis is initialising — domain scan starting...");
+    }
     return textResult(
       `Deep analysis in progress: ${job.domains_checked ?? 0} of ${job.domains_total ?? 0} domains checked. Check back in 30 seconds.`,
     );
@@ -317,28 +487,13 @@ async function getDeepAnalysisStatus(uploadId) {
     return textResult(`Deep analysis job ${job.status}. Trigger a new one with trigger_deep_analysis.`);
   }
 
-  const domainResults = Array.isArray(data.domain_results) ? data.domain_results : [];
-  const lines = [`Deep analysis complete. ${domainResults.length} domains analysed.`, ""];
-
-  for (const row of domainResults) {
-    lines.push(
-      `🏢 ${row.domain ?? "unknown"} — Score: ${row.business_legitimacy_score ?? "unknown"}/100 | Website: ${row.has_website ?? false} | SSL: ${row.has_ssl ?? false} | Parked: ${row.is_parked ?? false}`,
-    );
-
-    if (row.org_matched) {
-      lines.push(
-        `   Org: ${row.org_name ?? "Unknown"} | ${row.org_industry ?? "Unknown industry"} | ${row.org_employee_size ?? "Unknown"} employees | ${row.org_country ?? "Unknown country"} | ${row.org_linkedin_url ?? "No LinkedIn URL"}`,
-      );
-    }
-  }
-
-  return textResult(lines.join("\n"));
+  return formatDeepAnalysisResults(data);
 }
 
 const server = new Server(
   {
     name: "bounceprotect",
-    version: "1.2.0",
+    version: "1.2.6",
   },
   {
     capabilities: {
