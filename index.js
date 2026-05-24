@@ -172,6 +172,8 @@ async function fetchCompletedSmtpResults(uploadId, apiKey) {
 
   return textResult(
     [
+      `Upload ID: ${uploadId}`,
+      "",
       `SMTP verification complete for upload ${uploadId}.`,
       "",
       "Results:",
@@ -303,6 +305,11 @@ async function validateEmailsBulk(emails) {
     `- Unknown: ${counts.unknown}`,
   ];
 
+  if (data.upload_id) {
+    lines.push("", `upload_id: ${data.upload_id}`);
+    lines.push("Use this upload_id with trigger_deep_analysis for domain-level intelligence.");
+  }
+
   if (data.smtp_pending && data.smtp_upload_id) {
     const preliminaryOutput = [
       "⚠️ RESULTS INCOMPLETE — SMTP verification is running in the background.",
@@ -315,6 +322,7 @@ async function validateEmailsBulk(emails) {
       `Summary (preliminary): ${counts.valid} valid · ${counts.invalid} invalid · ${counts.risky} risky · ${counts.unknown} unknown`,
       "",
       "Waiting for SMTP verification to complete...",
+      `upload_id: ${data.smtp_upload_id}`,
     ].join("\n");
 
     const finalResult = await pollSmtpStatus(data.smtp_upload_id, getApiKey());
@@ -443,7 +451,10 @@ async function triggerDeepAnalysis(uploadId) {
         return textResult(completedResult.message);
       }
 
-      return formatDeepAnalysisResults(completedResult.data ?? {});
+      const completedText = formatDeepAnalysisResults(completedResult.data ?? {});
+      return textResult(
+        `Deep analysis already completed.\nupload_id: ${uploadId}\n\n${completedText.content?.[0]?.text ?? "Deep analysis results unavailable."}`,
+      );
     }
   } else {
     console.error("Deep analysis started — monitoring progress (checks every 20s, up to 10 min)...");
@@ -453,7 +464,10 @@ async function triggerDeepAnalysis(uploadId) {
     console.error("Deep analysis started — monitoring progress (checks every 20s, up to 10 min)...");
   }
 
-  return pollDeepAnalysis(uploadId, apiKey);
+  const finalResult = await pollDeepAnalysis(uploadId, apiKey);
+  return textResult(
+    `Deep analysis started.\nupload_id: ${uploadId}\nJob ID: ${data.job_id ?? "unknown"}.\nUse get_deep_analysis_status with this upload_id to poll for results.\n\n${finalResult.content?.[0]?.text ?? "Deep analysis results unavailable."}`,
+  );
 }
 
 async function getDeepAnalysisStatus(uploadId) {
